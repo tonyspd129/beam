@@ -494,7 +494,9 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     wallet = state.wallet
     hotkey = wallet.hotkey.ss58_address
     ip = await get_public_ip()
-    port = 9000
+    # Reported metadata only (nothing connects to the worker). Make it env-settable so
+    # multiple workers on one IP register distinct ip:port pairs.
+    port = int(os.environ.get("WORKER_PORT", "9000"))
 
     # Generate a payment pubkey
     payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
@@ -511,7 +513,7 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "hotkey": hotkey,
         "ip": ip,
         "port": port,
-        "claimed_bandwidth_mbps": 100,
+        "claimed_bandwidth_mbps": 200,
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
         "payment_pubkey": payment_pubkey,
         "signature": signature,
