@@ -402,6 +402,7 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
+        self.dedicated_gateway: Optional[Any] = None  # set in dedicated mode
 
         # Async control
         self._running: bool = False
@@ -1362,6 +1363,21 @@ class Orchestrator:
             logger.info(
                 f"WS registration config set: url={orch_url}, region={self.settings.region}"
             )
+
+            # DEDICATED mode: stand up the in-process worker gateway and attach it so
+            # transfer_assigned dispatches to OUR connected workers (not the public pool).
+            if getattr(self.settings, "dedicated_mode", False):
+                try:
+                    from .worker_gateway import DedicatedWorkerGateway
+                    self.dedicated_gateway = DedicatedWorkerGateway(
+                        get_client=lambda: self.subnet_core_client,
+                        settings=self.settings,
+                        worker_manager=self._worker_mgr,
+                    )
+                    self.subnet_core_client.set_dedicated_gateway(self.dedicated_gateway)
+                    logger.info("DEDICATED mode ON — workers connect to this orchestrator's /ws/{worker_id}")
+                except Exception as e:
+                    logger.error(f"Failed to start dedicated worker gateway: {e}")
 
             # Start WebSocket connection for real-time notifications and
             # orchestrator control-plane requests.

@@ -120,6 +120,15 @@ class OrchestratorSettings(BaseSettings):
 
     worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
 
+    # --- DEDICATED worker-gateway mode (this orchestrator hosts /ws/{worker_id}) ---
+    dedicated_mode: bool = Field(default=False, env="DEDICATED_MODE")
+    # Comma-separated worker hotkeys allowed to connect (empty = allow any to YOUR gateway).
+    worker_hotkey_allowlist: Optional[str] = Field(default=None, env="WORKER_HOTKEY_ALLOWLIST")
+    # Pre-shared secret your workers must present (checked before WS accept). Strongly recommended.
+    worker_gateway_secret: Optional[str] = Field(default=None, env="WORKER_GATEWAY_SECRET")
+    worker_gateway_max_conn: int = Field(default=64, env="WORKER_GATEWAY_MAX_CONN")
+    worker_gateway_max_per_ip: int = Field(default=8, env="WORKER_GATEWAY_MAX_PER_IP")
+
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================

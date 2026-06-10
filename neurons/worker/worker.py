@@ -103,7 +103,8 @@ FETCH_TIMEOUT = 30  # seconds
 SEND_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
-FETCH_STREAM_CHUNK_SIZE = 64 * 1024
+# Larger read buffer = fewer syscalls on the 20 MB chunk fetch (env-tunable).
+FETCH_STREAM_CHUNK_SIZE = int(os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(1024 * 1024)))
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
 
 
@@ -1058,8 +1059,15 @@ def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     else:
         ws_base = "ws://" + base
     url = f"{ws_base}/ws/{worker_id}"
+    params = []
     if api_key:
-        url = f"{url}?api_key={api_key}"
+        params.append(f"api_key={api_key}")
+    # DEDICATED gateway pre-shared secret (your orchestrator requires it before accept).
+    secret = os.environ.get("WORKER_GATEWAY_SECRET")
+    if secret:
+        params.append(f"token={secret}")
+    if params:
+        url = f"{url}?{'&'.join(params)}"
     return url
 
 
@@ -1555,14 +1563,23 @@ async def run_worker(state: WorkerState):
     if state.ws_send_lock is None:
         state.ws_send_lock = asyncio.Lock()
 
-    # Create HTTP client
-    state.http_client = httpx.AsyncClient(
+    # Create HTTP client. HTTP/2 (S3/GCS/R2 support it) trims round-trips on the
+    # presigned fetch/put; needs the `h2` package and falls back to HTTP/1.1 if it's
+    # missing or WORKER_HTTP2=false, so it can never break the worker.
+    _client_kwargs = dict(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
         limits=httpx.Limits(
             max_connections=max(8, MAX_CONCURRENT_TASKS * 4),
             max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * 2),
         ),
     )
+    try:
+        state.http_client = httpx.AsyncClient(
+            http2=_env_bool("WORKER_HTTP2", True), **_client_kwargs
+        )
+    except Exception as _e:  # e.g. h2 not installed
+        print(f"[Worker] HTTP/2 unavailable ({_e}); using HTTP/1.1")
+        state.http_client = httpx.AsyncClient(**_client_kwargs)
 
     try:
         async with httpx.AsyncClient() as client:

@@ -31,7 +31,7 @@ import time
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
@@ -264,6 +264,16 @@ async def get_worker_stats():
     if orchestrator:
         return orchestrator.get_worker_stats()
     return {"error": "Orchestrator not initialized"}
+
+
+@app.websocket("/ws/{worker_id}")
+async def worker_gateway_ws(websocket: WebSocket, worker_id: str):
+    """DEDICATED mode: your workers connect here instead of the public worker gateway."""
+    gw = getattr(orchestrator, "dedicated_gateway", None) if orchestrator else None
+    if gw is None:
+        await websocket.close(code=1011)  # dedicated mode not enabled
+        return
+    await gw.handle_worker(websocket, worker_id)
 
 
 @app.get("/metrics")

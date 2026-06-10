@@ -188,6 +188,11 @@ class SubnetCoreClient:
         # Pending worker-list requests keyed by transfer_id (WS protocol)
         self._pending_ws_requests: dict[str, asyncio.Future] = {}
 
+        # DEDICATED mode: in-process worker gateway + relay-ack correlation (keyed by offer_id)
+        self._dedicated_gateway = None
+        self._pending_response_acks: dict[str, asyncio.Future] = {}
+        self._pending_result_acks: dict[str, asyncio.Future] = {}
+
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
 
@@ -679,6 +684,20 @@ class SubnetCoreClient:
             self._note_beamcore_upstream_recovered("transfer_assigned from BeamCore")
             asyncio.create_task(self._handle_transfer_assigned(data))
 
+        # ----- DEDICATED mode relay (only meaningful when a gateway is attached) -----
+        elif msg_type == "worker_task_offer":
+            asyncio.create_task(self._handle_worker_task_offer(data))
+
+        elif msg_type == "worker_response_ack":
+            fut = self._pending_response_acks.pop(data.get("offer_id"), None)
+            if fut and not fut.done():
+                fut.set_result(data)
+
+        elif msg_type == "task_result_summary_ack":
+            fut = self._pending_result_acks.pop(data.get("offer_id"), None)
+            if fut and not fut.done():
+                fut.set_result(data)
+
         elif msg_type == "chunks_queued":
             self._note_beamcore_upstream_recovered("chunks_queued from BeamCore path")
             logger.info(
@@ -786,32 +805,44 @@ class SubnetCoreClient:
                 logger.error(f"No WS connection for transfer_assigned {transfer_id}")
                 return
 
-            try:
-                response = await self._send_ws_request(
-                    {
-                        "type": "list_public_workers",
-                        "transfer_id": transfer_id,
-                        "request_id": request_id,
-                    },
-                    timeout=max(30.0, float(self.timeout)),
-                )
-                workers = response.get("workers", [])
-            except Exception as e:
-                logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
-                return
+            if self._dedicated_gateway is not None:
+                # DEDICATED: assign only to OUR connected workers (BeamCore returns an
+                # empty worker_list for dedicated orchestrators). No list_public_workers.
+                worker_ids = self._dedicated_gateway.connected_worker_ids()
+                if not worker_ids:
+                    logger.warning(
+                        "dedicated: no workers connected to this orchestrator for "
+                        "assignment %s (transfer %s)", assignment_id, transfer_id)
+                    return
+                logger.info("dedicated: assigning chunks %d-%d across %d local worker(s)",
+                            chunk_start, chunk_end, len(worker_ids))
+            else:
+                try:
+                    response = await self._send_ws_request(
+                        {
+                            "type": "list_public_workers",
+                            "transfer_id": transfer_id,
+                            "request_id": request_id,
+                        },
+                        timeout=max(30.0, float(self.timeout)),
+                    )
+                    workers = response.get("workers", [])
+                except Exception as e:
+                    logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
+                    return
 
-            normalized_workers = _normalize_worker_list(workers, transfer_id)
-            if not normalized_workers:
-                logger.warning(f"No compatible workers available for assignment {assignment_id}")
-                return
+                normalized_workers = _normalize_worker_list(workers, transfer_id)
+                if not normalized_workers:
+                    logger.warning(f"No compatible workers available for assignment {assignment_id}")
+                    return
 
-            def worker_score(worker: dict[str, Any]) -> float:
-                trust = worker["trust_score"]
-                bandwidth = worker["bandwidth_mbps"]
-                return trust * min(2.0, bandwidth / 100.0)
+                def worker_score(worker: dict[str, Any]) -> float:
+                    trust = worker["trust_score"]
+                    bandwidth = worker["bandwidth_mbps"]
+                    return trust * min(2.0, bandwidth / 100.0)
 
-            sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
-            worker_ids = [worker["worker_id"] for worker in sorted_workers]
+                sorted_workers = sorted(normalized_workers, key=worker_score, reverse=True)
+                worker_ids = [worker["worker_id"] for worker in sorted_workers]
 
             assignments = [
                 {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
@@ -879,6 +910,80 @@ class SubnetCoreClient:
                 transfer_id,
                 assignment_id,
             )
+
+    # =========================================================================
+    # DEDICATED worker-gateway relay (orch <-> BeamCore side of the dedicated path)
+    # =========================================================================
+    def set_dedicated_gateway(self, gateway) -> None:
+        """Attach the in-process worker gateway -> enables the dedicated assignment path."""
+        self._dedicated_gateway = gateway
+        logger.info("dedicated worker gateway attached; assignment uses local worker pool")
+
+    async def _handle_worker_task_offer(self, data: dict) -> None:
+        """BeamCore -> orch: route a per-chunk offer to the target worker as a task_offer."""
+        if self._dedicated_gateway is None:
+            logger.debug("worker_task_offer received but no dedicated gateway attached")
+            return
+        worker_id = data.get("worker_id")
+        if not worker_id:
+            logger.warning("worker_task_offer missing worker_id: %s", data)
+            return
+        offer = {k: v for k, v in data.items() if k not in ("type", "worker_id")}
+        await self._dedicated_gateway.forward_offer(worker_id, offer)
+
+    async def relay_worker_response(
+        self, task_id, offer_id, worker_id, decision, reason=None
+    ) -> Dict[str, Any]:
+        """Relay a worker accept/reject to BeamCore; await worker_response_ack (by offer_id)."""
+        if not self._ws:
+            return {"accepted": False, "reason": "no_ws"}
+        msg = {
+            "type": "worker_response",
+            "task_id": task_id, "offer_id": offer_id, "worker_id": worker_id,
+            "decision": decision,
+        }
+        if reason:
+            msg["reason"] = reason
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_response_acks[offer_id] = fut
+        try:
+            await self._ws.send(json.dumps(msg))
+            return await asyncio.wait_for(fut, timeout=5.0)
+        except asyncio.TimeoutError:
+            return {"accepted": True, "reason": "ack_timeout"}  # optimistic; worker proceeds
+        except Exception as e:
+            return {"accepted": True, "reason": f"relay_err:{e}"}
+        finally:
+            self._pending_response_acks.pop(offer_id, None)
+
+    async def relay_task_result_summary(self, summary: dict) -> Dict[str, Any]:
+        """Relay a worker's task_result_summary to BeamCore; await task_result_summary_ack."""
+        offer_id = summary.get("offer_id")
+        if not self._ws:
+            return {"received": False, "completed": False, "reason": "no_ws"}
+        msg = {
+            "type": "task_result_summary",
+            "task_id": summary.get("task_id"),
+            "offer_id": offer_id,
+            "worker_id": summary.get("worker_id"),
+            "success": summary.get("success"),
+            "bytes_transferred": summary.get("bytes_transferred"),
+            "bandwidth_mbps": summary.get("bandwidth_mbps"),
+            "chunk_hash": summary.get("chunk_hash"),
+            "etag": summary.get("etag"),
+        }
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_result_acks[offer_id] = fut
+        try:
+            await self._ws.send(json.dumps(msg))
+            # verification can take a moment; wait longer than the response ack
+            return await asyncio.wait_for(fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            return {"received": True, "completed": False, "reason": "ack_timeout"}
+        except Exception as e:
+            return {"received": True, "completed": False, "reason": f"relay_err:{e}"}
+        finally:
+            self._pending_result_acks.pop(offer_id, None)
 
     def _schedule_ready_sync_if_needed(self) -> None:
         if not self._running or not self._ws_connected:
