@@ -8,7 +8,7 @@ import os
 from functools import lru_cache
 from typing import List, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -18,8 +18,12 @@ class OrchestratorSettings(BaseSettings):
     # ==========================================================================
     # API Settings
     # ==========================================================================
-    api_host: str = Field(default="0.0.0.0", env="ORCHESTRATOR_HOST")
-    api_port: int = Field(default=8000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
+    # pydantic-settings v2 ignores Field(env=...); use validation_alias so the documented
+    # env name is actually honored (field name 'api_host' != 'ORCHESTRATOR_HOST').
+    api_host: str = Field(default="0.0.0.0",
+                          validation_alias=AliasChoices("API_HOST", "ORCHESTRATOR_HOST"))
+    api_port: int = Field(default=8000,
+                          validation_alias=AliasChoices("API_PORT", "ORCHESTRATOR_PORT"))
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 
     # Local mode - skip Bittensor wallet/subtensor initialization for development
@@ -80,16 +84,20 @@ class OrchestratorSettings(BaseSettings):
     # Worker Management
     # ==========================================================================
     max_workers: int = Field(default=10000, env="MAX_WORKERS")
-    worker_timeout_seconds: int = Field(default=300, env="WORKER_TIMEOUT")
-    min_worker_bandwidth_mbps: float = Field(default=10.0, env="MIN_WORKER_BANDWIDTH")
+    worker_timeout_seconds: int = Field(default=300,
+        validation_alias=AliasChoices("WORKER_TIMEOUT_SECONDS", "WORKER_TIMEOUT"))
+    min_worker_bandwidth_mbps: float = Field(default=10.0,
+        validation_alias=AliasChoices("MIN_WORKER_BANDWIDTH_MBPS", "MIN_WORKER_BANDWIDTH"))
     worker_heartbeat_interval: int = Field(default=30, env="WORKER_HEARTBEAT_INTERVAL")
 
     # ==========================================================================
     # Task Settings
     # ==========================================================================
     max_concurrent_tasks: int = Field(default=1000, env="MAX_CONCURRENT_TASKS")
-    task_timeout_seconds: int = Field(default=120, env="TASK_TIMEOUT")
-    chunk_size_bytes: int = Field(default=1024 * 1024, env="CHUNK_SIZE")  # 1 MB
+    task_timeout_seconds: int = Field(default=120,
+        validation_alias=AliasChoices("TASK_TIMEOUT_SECONDS", "TASK_TIMEOUT"))
+    chunk_size_bytes: int = Field(default=1024 * 1024,
+        validation_alias=AliasChoices("CHUNK_SIZE_BYTES", "CHUNK_SIZE"))  # 1 MB
 
     # ==========================================================================
     # Proof Aggregation

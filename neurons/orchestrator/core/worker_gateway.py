@@ -51,6 +51,7 @@ class DedicatedWorkerGateway:
         self._conns: Dict[str, Any] = {}         # worker_id -> starlette WebSocket
         self._meta: Dict[str, dict] = {}         # worker_id -> {hotkey, capacity, last_seen}
         self._ip_counts: Dict[str, int] = {}     # client_ip -> live connection count
+        self._inflight: set = set()              # in-flight _on_worker_msg tasks (anti-GC)
         self.allowlist: Set[str] = _parse_allowlist(settings)
         # pre-shared secret: only workers presenting it may connect (you own both ends)
         self.secret: Optional[str] = getattr(settings, "worker_gateway_secret", None) or None
@@ -174,7 +175,11 @@ class DedicatedWorkerGateway:
                     msg = json.loads(raw)
                 except Exception:
                     continue
-                await self._on_worker_msg(worker_id, msg)
+                # dispatch off the read loop so a blocking upstream relay (accept/result)
+                # can't freeze this worker's connection (keeps acks within the worker's window)
+                _t = asyncio.create_task(self._on_worker_msg(worker_id, msg))
+                self._inflight.add(_t)
+                _t.add_done_callback(self._inflight.discard)
         except asyncio.TimeoutError:
             logger.info("dedicated worker %s idle %ds; closing", worker_id, _IDLE_TIMEOUT_S)
         except Exception as e:

@@ -77,43 +77,68 @@ MAINNET_URL = "https://beamcore.b1m.ai"
 # Connection mode: worker transport is websocket-only after registration.
 CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "websocket").lower()
 
+# --- env parsing helpers: strip inline '# comments' + tolerate bad values (no crash) ---
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = str(raw).split("#", 1)[0].strip()
+    if not raw:
+        return default
+    return raw.lower() in ("1", "true", "yes")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = str(raw).split("#", 1)[0].strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[Worker] WARN: {name}={os.environ.get(name)!r} is not an int; using {default}")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = str(raw).split("#", 1)[0].strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[Worker] WARN: {name}={os.environ.get(name)!r} is not a float; using {default}")
+        return default
+
+
 # WebSocket settings
 WS_RECONNECT_MIN_DELAY = 12.0  # must exceed server's 10s cooldown
 WS_RECONNECT_MAX_DELAY = 60.0
 WS_RECONNECT_MULTIPLIER = 2.0
-_ws_max_reconnect_attempts = os.environ.get("WS_MAX_RECONNECT_ATTEMPTS", "0").strip()
-WS_MAX_RECONNECT_ATTEMPTS = (
-    None if not _ws_max_reconnect_attempts or int(_ws_max_reconnect_attempts) <= 0 else int(_ws_max_reconnect_attempts)
-)
+_max_attempts = _env_int("WS_MAX_RECONNECT_ATTEMPTS", 0)
+WS_MAX_RECONNECT_ATTEMPTS = None if _max_attempts <= 0 else _max_attempts
 
 WS_PING_INTERVAL = 25  # seconds
 WS_STATS_SNAPSHOT_INTERVAL = 60  # seconds
 
 # Transfer settings
 DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
-MAX_CONCURRENT_TASKS = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
-MAX_QUEUED_WS_TASKS = max(
-    1, int(os.environ.get("WORKER_MAX_QUEUED_WS_TASKS", str(MAX_CONCURRENT_TASKS)))
-)
-MAX_IN_FLIGHT_BYTES = max(
-    DEFAULT_CHUNK_SIZE_BYTES,
-    int(os.environ.get("WORKER_MAX_IN_FLIGHT_BYTES", str(256 * 1024 * 1024))),
-)
+MAX_CONCURRENT_TASKS = max(1, _env_int("WORKER_MAX_CONCURRENT_TASKS", 4))
+MAX_QUEUED_WS_TASKS = max(1, _env_int("WORKER_MAX_QUEUED_WS_TASKS", MAX_CONCURRENT_TASKS))
+MAX_IN_FLIGHT_BYTES = max(DEFAULT_CHUNK_SIZE_BYTES, _env_int("WORKER_MAX_IN_FLIGHT_BYTES", 256 * 1024 * 1024))
 FETCH_TIMEOUT = 30  # seconds
 SEND_TIMEOUT = 30  # seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
 # Larger read buffer = fewer syscalls on the 20 MB chunk fetch (env-tunable).
-FETCH_STREAM_CHUNK_SIZE = int(os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(1024 * 1024)))
-WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes")
-
+FETCH_STREAM_CHUNK_SIZE = max(1, _env_int("WORKER_FETCH_STREAM_CHUNK_SIZE", 1024 * 1024))
+# must outlive the gateway's upstream relay (~8s) on the dedicated path so results get acked
+WS_TASK_RESULT_ACK_TIMEOUT = _env_float("WORKER_TASK_RESULT_ACK_TIMEOUT", 10.0)
 
 # Participant workers default to recording a payment obligation unless opted out.
 WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
@@ -496,7 +521,7 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     ip = await get_public_ip()
     # Reported metadata only (nothing connects to the worker). Make it env-settable so
     # multiple workers on one IP register distinct ip:port pairs.
-    port = int(os.environ.get("WORKER_PORT", "9000"))
+    port = _env_int("WORKER_PORT", 9000)
 
     # Generate a payment pubkey
     payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
@@ -678,7 +703,10 @@ def estimate_task_bytes(task: dict, execution_context: dict) -> int:
     except (TypeError, ValueError):
         chunk_size = DEFAULT_CHUNK_SIZE_BYTES
 
-    total_size = execution_context.get("total_size")
+    try:
+        total_size = int(execution_context.get("total_size") or 0)
+    except (TypeError, ValueError):
+        total_size = 0
     chunk_offset = execution_context.get("chunk_offset")
 
     try:
@@ -845,7 +873,10 @@ async def execute_transfer(
     object_id = execution_context.get("object_id")
     chunk_offset = execution_context.get("chunk_offset")
     chunk_size_ctx = execution_context.get("chunk_size")
-    total_size = execution_context.get("total_size", 0)
+    try:
+        total_size = int(execution_context.get("total_size", 0) or 0)
+    except (TypeError, ValueError):
+        total_size = 0
     auth_token = execution_context.get("auth_token")
     source_urls = execution_context.get("source_urls")
     dest_urls = execution_context.get("dest_urls")
@@ -864,7 +895,10 @@ async def execute_transfer(
     chunk_hashes: dict = {}
     if "chunk_hashes" in task_message and isinstance(task_message["chunk_hashes"], dict):
         for k, v in task_message["chunk_hashes"].items():
-            chunk_hashes[int(k)] = v
+            try:
+                chunk_hashes[int(k)] = v
+            except (TypeError, ValueError):
+                continue
     elif "chunk_hash" in task_message and task_message["chunk_hash"]:
         if len(chunk_indices) == 1:
             chunk_hashes[chunk_indices[0]] = task_message["chunk_hash"]
@@ -1054,7 +1088,9 @@ async def execute_transfer(
 def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     """Convert worker-gateway URL to the worker WebSocket URL."""
     base = gateway_url.rstrip("/")
-    if base.startswith("https://"):
+    if base.startswith(("ws://", "wss://")):
+        ws_base = base                       # already a ws URL — use as-is
+    elif base.startswith("https://"):
         ws_base = "wss://" + base[8:]
     elif base.startswith("http://"):
         ws_base = "ws://" + base[7:]
@@ -1505,13 +1541,16 @@ async def websocket_loop(state: WorkerState):
                             last_stats_snapshot = now
 
                     except ConnectionClosed as e:
-                        print(f"[Worker] [WS] Connection closed: {e.code} {e.reason}")
+                        _c = getattr(e, "rcvd", None)
+                        print(f"[Worker] [WS] Connection closed: "
+                              f"{_c.code if _c else None} {_c.reason if _c else ''}")
                         break
 
         except InvalidStatus as e:
-            print(f"[Worker] [WS] Connection rejected: HTTP {e.status_code}")
+            status = get_ws_status_code(e)
+            print(f"[Worker] [WS] Connection rejected: HTTP {status}")
             raise RuntimeError(
-                f"worker-gateway websocket rejected the connection with HTTP {e.status_code}"
+                f"worker-gateway websocket rejected the connection with HTTP {status}"
             ) from e
 
         except ConnectionRefusedError:

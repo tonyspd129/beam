@@ -948,7 +948,8 @@ class SubnetCoreClient:
         self._pending_response_acks[offer_id] = fut
         try:
             await self._ws.send(json.dumps(msg))
-            return await asyncio.wait_for(fut, timeout=5.0)
+            # keep under the worker's task_accept_ack window (~5s) so it doesn't abort
+            return await asyncio.wait_for(fut, timeout=2.0)
         except asyncio.TimeoutError:
             return {"accepted": True, "reason": "ack_timeout"}  # optimistic; worker proceeds
         except Exception as e:
@@ -976,8 +977,9 @@ class SubnetCoreClient:
         self._pending_result_acks[offer_id] = fut
         try:
             await self._ws.send(json.dumps(msg))
-            # verification can take a moment; wait longer than the response ack
-            return await asyncio.wait_for(fut, timeout=30.0)
+            # bounded so the worker's task_result_summary_ack wait (raise
+            # WORKER_TASK_RESULT_ACK_TIMEOUT>=10) outlives one upstream attempt
+            return await asyncio.wait_for(fut, timeout=8.0)
         except asyncio.TimeoutError:
             return {"received": True, "completed": False, "reason": "ack_timeout"}
         except Exception as e:

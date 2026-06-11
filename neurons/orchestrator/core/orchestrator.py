@@ -514,6 +514,7 @@ class Orchestrator:
                 self.metagraph = bt.Metagraph(
                     netuid=self.settings.netuid,
                     network=self.subtensor.network,
+                    sync=False,
                 )
                 self.metagraph.sync(subtensor=self.subtensor)
                 return
@@ -1039,25 +1040,26 @@ class Orchestrator:
         now = _time.time()
         cache_ttl = 300  # 5 minutes
         if (
-            not hasattr(self, "_cached_alpha_per_tao")
+            not hasattr(self, "_cached_tao_per_alpha")
             or (now - getattr(self, "_cached_price_at", 0)) > cache_ttl
         ):
             try:
                 price = self.subtensor.get_subnet_price(self.settings.netuid)
-                self._cached_alpha_per_tao = float(price)
+                # get_subnet_price returns TAO per 1 alpha
+                self._cached_tao_per_alpha = float(price)
                 self._cached_price_at = now
             except Exception as e:
                 logger.warning(f"Could not convert emission alpha→TAO: {e}")
                 # Use stale cache if available
-                if not hasattr(self, "_cached_alpha_per_tao"):
+                if not hasattr(self, "_cached_tao_per_alpha"):
                     return emission_alpha
 
-        alpha_per_tao = getattr(self, "_cached_alpha_per_tao", 0)
-        if alpha_per_tao > 0:
-            emission_tao = emission_alpha / alpha_per_tao
+        tao_per_alpha = getattr(self, "_cached_tao_per_alpha", 0)
+        if tao_per_alpha > 0:
+            emission_tao = emission_alpha * tao_per_alpha
             logger.debug(
                 f"Emission: {emission_alpha:.4f} ध → {emission_tao:.9f} TAO "
-                f"(rate: {alpha_per_tao:.2f} ध/τ)"
+                f"(rate: {tao_per_alpha:.4f} τ/ध)"
             )
             return emission_tao
 
