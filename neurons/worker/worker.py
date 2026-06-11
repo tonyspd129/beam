@@ -41,7 +41,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -1063,11 +1063,12 @@ def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     url = f"{ws_base}/ws/{worker_id}"
     params = []
     if api_key:
-        params.append(f"api_key={api_key}")
-    # DEDICATED gateway pre-shared secret (your orchestrator requires it before accept).
+        params.append(f"api_key={quote(str(api_key), safe='')}")
+    # DEDICATED gateway pre-shared secret. URL-encoded so special chars (&, #, !, …)
+    # don't corrupt the query string and break gateway auth.
     secret = os.environ.get("WORKER_GATEWAY_SECRET")
     if secret:
-        params.append(f"token={secret}")
+        params.append(f"token={quote(secret, safe='')}")
     if params:
         url = f"{url}?{'&'.join(params)}"
     return url
@@ -1642,8 +1643,18 @@ async def main():
     # Parse configuration
     config = get_config()
 
-    # Load bittensor wallet
-    wallet = bt.Wallet(config=config)
+    # Load bittensor wallet. bittensor 10.x ignores --wallet.* passed via bt.Config in
+    # some builds, so resolve the identity explicitly: CLI flags -> env -> config -> default.
+    _wp = argparse.ArgumentParser(add_help=False)
+    _wp.add_argument("--wallet.name", dest="w_name", default=None)
+    _wp.add_argument("--wallet.hotkey", dest="w_hotkey", default=None)
+    _wp.add_argument("--wallet.path", dest="w_path", default=None)
+    _wa, _ = _wp.parse_known_args()
+    _cw = getattr(config, "wallet", None)
+    _name = _wa.w_name or os.environ.get("WALLET_NAME") or getattr(_cw, "name", None) or "default"
+    _hot = _wa.w_hotkey or os.environ.get("WALLET_HOTKEY") or getattr(_cw, "hotkey", None) or "default"
+    _path = _wa.w_path or os.environ.get("WALLET_PATH") or getattr(_cw, "path", None) or "~/.bittensor/wallets"
+    wallet = bt.Wallet(name=_name, hotkey=_hot, path=_path)
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
